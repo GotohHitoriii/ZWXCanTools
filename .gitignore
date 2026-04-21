@@ -1,0 +1,64 @@
+# Build directories
+build/
+build-*/
+out/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# Ninja / Make / MSBuild output
+.ninja_deps
+.ninja_log
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.ipdb
+*.iobj
+*.tlog
+*.lastbuildstate
+
+# Windows binaries generated during local builds
+*.exe
+*.dll
+*.msi
+*.zip
+
+# Local reference materials and third-party SDK files.
+# This directory is only for development-time references and must not be committed.
+reference/
+third_party/can_sdk/
+
+# Qt generated files
+*_autogen/
+.qt/
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# IDE / editor files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.sln.docstates
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Local runtime logs / dumps
+*.log
+*.dmp
+*.crash

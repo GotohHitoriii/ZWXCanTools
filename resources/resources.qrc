@@ -1,0 +1,9 @@
+<RCC>
+    <qresource prefix="/icons">
+        <file alias="chevron-down.svg">icons/chevron-down.svg</file>
+        <file alias="chevron-up.svg">icons/chevron-up.svg</file>
+        <file alias="can-receive.svg">icons/can-receive.svg</file>
+        <file alias="can-send.svg">icons/can-send.svg</file>
+        <file alias="device.svg">icons/device.svg</file>
+    </qresource>
+</RCC>
