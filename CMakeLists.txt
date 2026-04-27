@@ -18,6 +18,8 @@ qt_add_executable(ZWXCanTools WIN32
     src/main.cpp
     src/main_window.cpp
     src/main_window.h
+    src/uds_upgrade_manager.cpp
+    src/uds_upgrade_manager.h
     resources/resources.qrc
 )
 

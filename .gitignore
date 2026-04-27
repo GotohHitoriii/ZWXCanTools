@@ -37,6 +37,7 @@ Testing/
 # This directory is only for development-time references and must not be committed.
 reference/
 third_party/can_sdk/
+uds_diag/
 
 # Qt generated files
 *_autogen/

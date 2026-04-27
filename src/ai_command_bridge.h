@@ -17,8 +17,10 @@ class AiCommandBridge final : public QObject
 
 public:
     explicit AiCommandBridge(DeviceController *controller, QObject *parent = nullptr);
+    ~AiCommandBridge() override;
 
     bool startLocalServer(quint16 webSocketPort = 17651, quint16 tcpPort = 17652);
+    void stopLocalServer();
     Q_INVOKABLE QJsonObject execute(const QJsonObject &command);
 
 Q_SIGNALS:

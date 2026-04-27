@@ -81,52 +81,17 @@ AiCommandBridge::AiCommandBridge(DeviceController *controller, QObject *parent)
     });
 }
 
+AiCommandBridge::~AiCommandBridge()
+{
+    stopLocalServer();
+}
+
 bool AiCommandBridge::startLocalServer(quint16 webSocketPort, quint16 tcpPort)
 {
-    if (server_ != nullptr && tcpServer_ != nullptr) {
+    Q_UNUSED(webSocketPort);
+
+    if (tcpServer_ != nullptr) {
         return true;
-    }
-
-    bool webSocketStartedNow = false;
-
-    if (server_ == nullptr) {
-        server_ = new QWebSocketServer(QStringLiteral("ZWXCanTools AI Bridge"), QWebSocketServer::NonSecureMode, this);
-        if (!server_->listen(QHostAddress::LocalHost, webSocketPort)) {
-            server_->deleteLater();
-            server_ = nullptr;
-        } else {
-            webSocketStartedNow = true;
-        }
-    }
-
-    if (webSocketStartedNow) {
-        connect(server_, &QWebSocketServer::newConnection, this, [this]() {
-            auto *client = server_->nextPendingConnection();
-            if (client == nullptr) {
-                return;
-            }
-
-            connect(client, &QWebSocket::textMessageReceived, this, [this, client](const QString &message) {
-                const auto document = QJsonDocument::fromJson(message.toUtf8());
-                if (!document.isObject()) {
-                    client->sendTextMessage(QJsonDocument({
-                        {QStringLiteral("ok"), false},
-                        {QStringLiteral("error"), QStringLiteral("invalid_json")},
-                    }).toJson(QJsonDocument::Compact));
-                    return;
-                }
-
-                const QJsonObject result = execute(document.object());
-                client->sendTextMessage(QJsonDocument(result).toJson(QJsonDocument::Compact));
-            });
-
-            connect(client, &QWebSocket::disconnected, client, [client]() {
-                client->deleteLater();
-            });
-
-            // The client should request get_state after connecting. Avoid pushing
-            // during the WebSocket handshake; some Windows clients disconnect here.
-        });
     }
 
     if (tcpServer_ == nullptr) {
@@ -146,9 +111,52 @@ bool AiCommandBridge::startLocalServer(quint16 webSocketPort, quint16 tcpPort)
         }
     }
 
-    const bool anyServerStarted = server_ != nullptr || tcpServer_ != nullptr;
+    const bool anyServerStarted = tcpServer_ != nullptr;
     Q_EMIT bridgeMessage(anyServerStarted ? QStringLiteral("AI 本地接口已启动") : QStringLiteral("AI 本地接口启动失败"));
     return anyServerStarted;
+}
+
+void AiCommandBridge::stopLocalServer()
+{
+    if (server_ != nullptr) {
+        const auto webSocketClients = server_->findChildren<QWebSocket *>();
+        for (auto *client : webSocketClients) {
+            if (client == nullptr) {
+                continue;
+            }
+            client->disconnect();
+            client->close();
+        }
+
+        server_->disconnect();
+        server_->close();
+        server_ = nullptr;
+    }
+
+    const auto tcpClients = tcpBuffers_.keys();
+    tcpBuffers_.clear();
+    for (auto *client : tcpClients) {
+        if (client == nullptr) {
+            continue;
+        }
+        client->disconnect();
+        client->abort();
+    }
+
+    if (tcpServer_ != nullptr) {
+        const auto strayTcpClients = tcpServer_->findChildren<QTcpSocket *>();
+        for (auto *client : strayTcpClients) {
+            if (client == nullptr) {
+                continue;
+            }
+            client->disconnect();
+            client->abort();
+        }
+
+        tcpServer_->disconnect();
+        tcpServer_->close();
+        tcpServer_ = nullptr;
+    }
 }
 
 QJsonObject AiCommandBridge::execute(const QJsonObject &command)

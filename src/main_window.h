@@ -6,11 +6,14 @@
 #include <QVector>
 
 class AiCommandBridge;
+class UdsUpgradeManager;
 class QComboBox;
 class QDialog;
 class QFrame;
 class QLabel;
 class QLineEdit;
+class QPlainTextEdit;
+class QProgressBar;
 class QPushButton;
 class QSpinBox;
 class QStackedWidget;
@@ -45,10 +48,17 @@ private:
     void buildUi();
     void buildSidebar();
     void buildDevicePage();
+    void buildUdsUpgradePage();
     void buildCanSendPage(int channelIndex);
     void buildCanReceivePage(int channelIndex);
     void applyAppStyle();
     void selectPage(int pageIndex, QPushButton *selectedButton);
+    void browseUdsFirmware();
+    void startUdsUpgrade();
+    void updateUdsFirmwareSummary(const QString &path);
+    void appendUdsLog(const QString &message);
+    void loadUdsSettings();
+    void saveUdsSettings() const;
     void showAddSendFrameDialog(int channelIndex);
     void addSendFrameRow(const SendFrameConfig &config, bool persist = true);
     void loadSendFrames();
@@ -79,6 +89,19 @@ private:
     QLabel *deviceStatusPill_ = nullptr;
     QFrame *deviceTreePanel_ = nullptr;
     QLabel *deviceNameLabel_ = nullptr;
+    QComboBox *udsChannelCombo_ = nullptr;
+    QLineEdit *udsPhysicalIdEdit_ = nullptr;
+    QLineEdit *udsResponseIdEdit_ = nullptr;
+    QLineEdit *udsFunctionalIdEdit_ = nullptr;
+    QLineEdit *udsSeedOperatorEdit_ = nullptr;
+    QLineEdit *udsFirmwarePathEdit_ = nullptr;
+    QLabel *udsChannelSummaryLabel_ = nullptr;
+    QLabel *udsFirmwareSummaryLabel_ = nullptr;
+    QLabel *udsUpgradeStatusPill_ = nullptr;
+    QProgressBar *udsProgressBar_ = nullptr;
+    QPlainTextEdit *udsLogEdit_ = nullptr;
+    QPushButton *udsStartButton_ = nullptr;
+    UdsUpgradeManager *udsUpgradeManager_ = nullptr;
     QPushButton *channel0StartButton_ = nullptr;
     QPushButton *channel1StartButton_ = nullptr;
     QLabel *channel0Status_ = nullptr;

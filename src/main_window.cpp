@@ -1,6 +1,7 @@
 #include "main_window.h"
 
 #include "ai_command_bridge.h"
+#include "uds_upgrade_manager.h"
 
 #include <QAbstractItemView>
 #include <QByteArray>
@@ -8,7 +9,11 @@
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDialog>
+#include <QDir>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QIcon>
@@ -19,10 +24,13 @@
 #include <QMessageBox>
 #include <QPair>
 #include <QPointer>
+#include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QScrollArea>
+#include <QScrollBar>
 #include <QSettings>
 #include <QSize>
 #include <QSizePolicy>
@@ -41,6 +49,16 @@
 
 namespace
 {
+constexpr quint32 kTargetUdsFunctionalId = 0x0CD4FDFD;
+constexpr quint32 kTargetUdsPhysicalId = 0x0CD617FD;
+constexpr quint32 kTargetUdsResponseId = 0x0CD6FD17;
+constexpr quint32 kTargetUdsSeedKeyOperator = 0xEDB88317;
+constexpr quint32 kTargetUdsBinDownloadAddress = 0x00000000;
+constexpr quint8 kTargetUdsProgrammingSession = 0x02;
+constexpr quint8 kTargetUdsSeedSubFunction = 0x01;
+constexpr quint8 kTargetUdsKeySubFunction = 0x02;
+constexpr quint8 kTargetUdsHardResetSubFunction = 0x01;
+
 void repolish(QWidget *widget)
 {
     widget->style()->unpolish(widget);
@@ -142,15 +160,43 @@ QTableWidgetItem *makeTableItem(const QString &text)
     return item;
 }
 
+QString udsHex32(quint32 value)
+{
+    return QStringLiteral("0x%1").arg(value, 8, 16, QLatin1Char('0')).toUpper();
+}
+
+QString udsHex8(quint8 value)
+{
+    return QStringLiteral("0x%1").arg(value, 2, 16, QLatin1Char('0')).toUpper();
+}
+
+UdsUpgradeConfig makeTargetUdsUpgradeConfig(int channelIndex, const QString &firmwarePath)
+{
+    UdsUpgradeConfig config;
+    config.channelIndex = channelIndex;
+    config.functionalId = kTargetUdsFunctionalId;
+    config.physicalId = kTargetUdsPhysicalId;
+    config.responseId = kTargetUdsResponseId;
+    config.seedKeyOperator = kTargetUdsSeedKeyOperator;
+    config.downloadAddress = kTargetUdsBinDownloadAddress;
+    config.programSessionSubFunction = kTargetUdsProgrammingSession;
+    config.seedRequestSubFunction = kTargetUdsSeedSubFunction;
+    config.keySendSubFunction = kTargetUdsKeySubFunction;
+    config.hardResetSubFunction = kTargetUdsHardResetSubFunction;
+    config.firmwarePath = firmwarePath;
+    return config;
+}
+
 } // namespace
 
 MainWindow::MainWindow(DeviceController *controller, AiCommandBridge *aiBridge, QWidget *parent)
     : QMainWindow(parent)
     , controller_(controller)
     , aiBridge_(aiBridge)
+    , udsUpgradeManager_(new UdsUpgradeManager(controller, this))
 {
     setWindowTitle(QStringLiteral("ZWXCanTools"));
-    setMinimumSize(1040, 660);
+    setMinimumSize(1280, 780);
     buildUi();
     applyAppStyle();
 
@@ -162,7 +208,41 @@ MainWindow::MainWindow(DeviceController *controller, AiCommandBridge *aiBridge, 
         messageLabel_->setText(message);
     });
     connect(QCoreApplication::instance(), &QCoreApplication::aboutToQuit, this, &MainWindow::stopReceiveTimers);
+    connect(udsUpgradeManager_, &UdsUpgradeManager::logMessage, this, &MainWindow::appendUdsLog);
+    connect(udsUpgradeManager_, &UdsUpgradeManager::progressChanged, this, [this](int progress) {
+        if (udsProgressBar_ != nullptr) {
+            udsProgressBar_->setValue(progress);
+        }
+    });
+    connect(udsUpgradeManager_, &UdsUpgradeManager::statusChanged, this, [this](const QString &text, const QString &state) {
+        if (udsUpgradeStatusPill_ != nullptr) {
+            udsUpgradeStatusPill_->setText(text);
+            udsUpgradeStatusPill_->setProperty("state", state);
+            repolish(udsUpgradeStatusPill_);
+        }
+    });
+    connect(udsUpgradeManager_, &UdsUpgradeManager::runningChanged, this, [this](bool running) {
+        if (udsStartButton_ != nullptr) {
+            udsStartButton_->setText(running ? QStringLiteral("停止升级") : QStringLiteral("开始升级"));
+            udsStartButton_->setProperty("tone", running ? QStringLiteral("destructive") : QStringLiteral("accent"));
+            udsStartButton_->setProperty("active", running);
+            repolish(udsStartButton_);
+        }
+    });
+    connect(udsUpgradeManager_, &UdsUpgradeManager::finished, this, [this](bool success, const QString &summary) {
+        messageLabel_->setText(summary);
+        if (can0ReceiveTimer_ != nullptr) {
+            can0ReceiveTimer_->start();
+        }
+        if (can1ReceiveTimer_ != nullptr) {
+            can1ReceiveTimer_->start();
+        }
+        if (success) {
+            saveUdsSettings();
+        }
+    });
 
+    loadUdsSettings();
     refreshState(controller_->state());
 }
 
@@ -191,10 +271,21 @@ void MainWindow::buildUi()
     sidebarLayout->setContentsMargins(14, 14, 14, 14);
     sidebarLayout->setSpacing(10);
 
-    menuLayout_ = new QVBoxLayout();
+    auto *menuScroll = new QScrollArea(sidebar);
+    menuScroll->setObjectName(QStringLiteral("sidebarScroll"));
+    menuScroll->setWidgetResizable(true);
+    menuScroll->setFrameShape(QFrame::NoFrame);
+    menuScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    menuScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+    auto *menuContainer = new QWidget(menuScroll);
+    menuContainer->setObjectName(QStringLiteral("sidebarMenuContainer"));
+    menuLayout_ = new QVBoxLayout(menuContainer);
+    menuLayout_->setContentsMargins(0, 0, 0, 0);
     menuLayout_->setSpacing(8);
-    sidebarLayout->addLayout(menuLayout_);
-    sidebarLayout->addStretch();
+    menuLayout_->addStretch();
+    menuScroll->setWidget(menuContainer);
+    sidebarLayout->addWidget(menuScroll, 1);
 
     messageLabel_ = new QLabel(QStringLiteral("就绪"), sidebar);
     messageLabel_->setObjectName(QStringLiteral("messageLabel"));
@@ -211,6 +302,7 @@ void MainWindow::buildUi()
 
     buildSidebar();
     buildDevicePage();
+    buildUdsUpgradePage();
     buildCanSendPage(0);
     buildCanReceivePage(0);
     buildCanSendPage(1);
@@ -226,7 +318,14 @@ void MainWindow::buildSidebar()
         selectPage(0, qobject_cast<QPushButton *>(sender()));
     });
     menuButtons_.append(deviceButton);
-    menuLayout_->addWidget(deviceButton);
+    menuLayout_->insertWidget(qMax(0, menuLayout_->count() - 1), deviceButton);
+
+    auto *udsButton = makeMenuButton(QStringLiteral("UDS升级"), QStringLiteral("UDS"), this);
+    connect(udsButton, &QPushButton::clicked, this, [this, udsButton]() {
+        selectPage(1, udsButton);
+    });
+    menuButtons_.append(udsButton);
+    menuLayout_->insertWidget(qMax(0, menuLayout_->count() - 1), udsButton);
 
     const QList<QPair<QString, QString>> items = {
         {QStringLiteral("CAN0发送"), QStringLiteral("TX")},
@@ -237,12 +336,12 @@ void MainWindow::buildSidebar()
 
     for (int i = 0; i < items.size(); ++i) {
         auto *button = makeMenuButton(items.at(i).first, items.at(i).second, this);
-        const int pageIndex = i + 1;
+        const int pageIndex = i + 2;
         connect(button, &QPushButton::clicked, this, [this, pageIndex, button]() {
             selectPage(pageIndex, button);
         });
         menuButtons_.append(button);
-        menuLayout_->addWidget(button);
+        menuLayout_->insertWidget(qMax(0, menuLayout_->count() - 1), button);
     }
 }
 
@@ -365,6 +464,191 @@ void MainWindow::buildDevicePage()
     });
     connect(channel0StartButton_, &QPushButton::clicked, this, [this]() { showStartDialog(0); });
     connect(channel1StartButton_, &QPushButton::clicked, this, [this]() { showStartDialog(1); });
+
+    stack_->addWidget(page);
+}
+
+void MainWindow::buildUdsUpgradePage()
+{
+    auto *page = new QWidget(stack_);
+    page->setObjectName(QStringLiteral("contentPage"));
+    auto *outerLayout = new QVBoxLayout(page);
+    outerLayout->setContentsMargins(0, 0, 0, 0);
+    outerLayout->setSpacing(0);
+
+    auto *scrollArea = new QScrollArea(page);
+    scrollArea->setObjectName(QStringLiteral("udsScrollArea"));
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setFrameShape(QFrame::NoFrame);
+    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+
+    auto *content = new QWidget(scrollArea);
+    content->setObjectName(QStringLiteral("udsPageContent"));
+    auto *pageLayout = new QVBoxLayout(content);
+    pageLayout->setContentsMargins(36, 24, 28, 36);
+    pageLayout->setSpacing(18);
+    scrollArea->setWidget(content);
+    outerLayout->addWidget(scrollArea);
+
+    auto *headerRow = new QHBoxLayout();
+    auto *heading = new QLabel(QStringLiteral("UDS升级"), page);
+    heading->setObjectName(QStringLiteral("pageTitle"));
+    udsUpgradeStatusPill_ = makeStatusPill(QStringLiteral("未开始"), page);
+    headerRow->addWidget(heading);
+    headerRow->addStretch();
+    headerRow->addWidget(udsUpgradeStatusPill_);
+    pageLayout->addLayout(headerRow);
+
+    auto *hintLabel = new QLabel(QStringLiteral("保留通道、寻址 ID 和 27 算子；会话切换、27 子功能、下载地址和复位流程由软件自动接管。"), page);
+    hintLabel->setObjectName(QStringLiteral("udsHintLabel"));
+    pageLayout->addWidget(hintLabel);
+
+    auto *contentRow = new QHBoxLayout();
+    contentRow->setSpacing(18);
+
+    auto *configPanel = makeCardPanel(content);
+    configPanel->setObjectName(QStringLiteral("udsConfigPanel"));
+    configPanel->setMinimumWidth(560);
+    auto *configLayout = new QVBoxLayout(configPanel);
+    configLayout->setContentsMargins(24, 24, 24, 22);
+    configLayout->setSpacing(16);
+
+    auto *configTitle = new QLabel(QStringLiteral("升级配置"), configPanel);
+    configTitle->setObjectName(QStringLiteral("sectionTitle"));
+    configLayout->addWidget(configTitle);
+
+    auto makeHexEdit = [configPanel](const QString &placeholder, const QString &value, int maxNibbles) {
+        auto *edit = new QLineEdit(configPanel);
+        edit->setObjectName(QStringLiteral("fieldEdit"));
+        edit->setPlaceholderText(placeholder);
+        edit->setText(value);
+        edit->setMinimumHeight(42);
+        edit->setMinimumWidth(240);
+        edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        edit->setValidator(new QRegularExpressionValidator(
+            QRegularExpression(QStringLiteral("[0-9A-Fa-f]{0,%1}").arg(maxNibbles)), edit));
+        return edit;
+    };
+
+    auto *grid = new QGridLayout();
+    grid->setHorizontalSpacing(18);
+    grid->setVerticalSpacing(14);
+    grid->setColumnStretch(0, 1);
+    grid->setColumnStretch(1, 1);
+
+    auto addField = [configPanel, grid](int row, int column, const QString &labelText, QWidget *control) {
+        auto *box = new QWidget(configPanel);
+        auto *boxLayout = new QVBoxLayout(box);
+        boxLayout->setContentsMargins(0, 0, 0, 0);
+        boxLayout->setSpacing(8);
+        auto *label = new QLabel(labelText, box);
+        label->setObjectName(QStringLiteral("fieldLabel"));
+        boxLayout->addWidget(label);
+        boxLayout->addWidget(control);
+        grid->addWidget(box, row, column);
+    };
+
+    udsChannelCombo_ = new QComboBox(configPanel);
+    udsChannelCombo_->setObjectName(QStringLiteral("fieldCombo"));
+    udsChannelCombo_->addItems({QStringLiteral("CAN0"), QStringLiteral("CAN1")});
+    udsChannelCombo_->setMinimumHeight(42);
+    udsChannelCombo_->setMinimumWidth(240);
+    udsChannelCombo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    configureComboBox(udsChannelCombo_);
+    addField(0, 0, QStringLiteral("升级通道"), udsChannelCombo_);
+
+    udsPhysicalIdEdit_ = makeHexEdit(QStringLiteral("0CD617FD"), QStringLiteral("0CD617FD"), 8);
+    addField(0, 1, QStringLiteral("物理寻址标识 ID"), udsPhysicalIdEdit_);
+
+    udsResponseIdEdit_ = makeHexEdit(QStringLiteral("0CD6FD17"), QStringLiteral("0CD6FD17"), 8);
+    addField(1, 0, QStringLiteral("诊断响应标识 ID"), udsResponseIdEdit_);
+
+    udsFunctionalIdEdit_ = makeHexEdit(QStringLiteral("0CD4FDFD"), QStringLiteral("0CD4FDFD"), 8);
+    addField(1, 1, QStringLiteral("功能寻址标识 ID"), udsFunctionalIdEdit_);
+
+    udsSeedOperatorEdit_ = makeHexEdit(QStringLiteral("EDB88317"), QStringLiteral("EDB88317"), 8);
+    addField(2, 0, QStringLiteral("27 服务算子"), udsSeedOperatorEdit_);
+
+    udsChannelSummaryLabel_ = new QLabel(
+        QStringLiteral("自动链路：0x10 02 -> 0x27 01/02 -> 0x34 -> 0x36 -> 0x37 -> 0x11 01"),
+        configPanel);
+    udsChannelSummaryLabel_->setObjectName(QStringLiteral("udsSummaryLabel"));
+    udsChannelSummaryLabel_->setWordWrap(true);
+    grid->addWidget(udsChannelSummaryLabel_, 2, 1);
+
+    auto *firmwareBox = new QWidget(configPanel);
+    auto *firmwareBoxLayout = new QVBoxLayout(firmwareBox);
+    firmwareBoxLayout->setContentsMargins(0, 0, 0, 0);
+    firmwareBoxLayout->setSpacing(8);
+    auto *firmwareLabel = new QLabel(QStringLiteral("固件文件"), firmwareBox);
+    firmwareLabel->setObjectName(QStringLiteral("fieldLabel"));
+    firmwareBoxLayout->addWidget(firmwareLabel);
+
+    auto *firmwareRow = new QWidget(firmwareBox);
+    auto *firmwareRowLayout = new QHBoxLayout(firmwareRow);
+    firmwareRowLayout->setContentsMargins(0, 0, 0, 0);
+    firmwareRowLayout->setSpacing(10);
+
+    udsFirmwarePathEdit_ = new QLineEdit(page);
+    udsFirmwarePathEdit_->setObjectName(QStringLiteral("fieldEdit"));
+    udsFirmwarePathEdit_->setReadOnly(true);
+    udsFirmwarePathEdit_->setPlaceholderText(QStringLiteral("选择 .pkg / .bin / .hex 固件"));
+    udsFirmwarePathEdit_->setMinimumHeight(42);
+    firmwareRowLayout->addWidget(udsFirmwarePathEdit_, 1);
+
+    auto *browseButton = new QPushButton(QStringLiteral("打开"), configPanel);
+    browseButton->setObjectName(QStringLiteral("secondaryButton"));
+    browseButton->setMinimumWidth(96);
+    firmwareRowLayout->addWidget(browseButton);
+    firmwareBoxLayout->addWidget(firmwareRow);
+    grid->addWidget(firmwareBox, 3, 0, 1, 2);
+
+    configLayout->addLayout(grid);
+
+    udsFirmwareSummaryLabel_ = new QLabel(
+        QStringLiteral("HEX 按记录地址下载；PKG/BIN 按生产转换脚本的基地址 0x00000000 下载。"),
+        configPanel);
+    udsFirmwareSummaryLabel_->setObjectName(QStringLiteral("udsSummaryLabel"));
+    configLayout->addWidget(udsFirmwareSummaryLabel_);
+
+    auto *buttonRow = new QHBoxLayout();
+    udsStartButton_ = makePrimaryButton(QStringLiteral("开始升级"), configPanel);
+    udsStartButton_->setProperty("tone", QStringLiteral("accent"));
+    buttonRow->addStretch();
+    buttonRow->addWidget(udsStartButton_);
+    configLayout->addLayout(buttonRow);
+
+    auto *statusPanel = makeCardPanel(content);
+    statusPanel->setObjectName(QStringLiteral("udsStatusPanel"));
+    statusPanel->setMinimumWidth(360);
+    auto *statusLayout = new QVBoxLayout(statusPanel);
+    statusLayout->setContentsMargins(24, 24, 24, 22);
+    statusLayout->setSpacing(14);
+
+    auto *statusTitle = new QLabel(QStringLiteral("升级反馈"), statusPanel);
+    statusTitle->setObjectName(QStringLiteral("sectionTitle"));
+    statusLayout->addWidget(statusTitle);
+
+    udsProgressBar_ = new QProgressBar(statusPanel);
+    udsProgressBar_->setObjectName(QStringLiteral("udsProgressBar"));
+    udsProgressBar_->setRange(0, 100);
+    udsProgressBar_->setValue(0);
+    statusLayout->addWidget(udsProgressBar_);
+
+    udsLogEdit_ = new QPlainTextEdit(statusPanel);
+    udsLogEdit_->setObjectName(QStringLiteral("udsLog"));
+    udsLogEdit_->setReadOnly(true);
+    udsLogEdit_->setPlaceholderText(QStringLiteral("升级日志会显示在这里"));
+    statusLayout->addWidget(udsLogEdit_, 1);
+
+    contentRow->addWidget(configPanel, 7);
+    contentRow->addWidget(statusPanel, 5);
+    pageLayout->addLayout(contentRow, 1);
+    pageLayout->addStretch();
+
+    connect(browseButton, &QPushButton::clicked, this, &MainWindow::browseUdsFirmware);
+    connect(udsStartButton_, &QPushButton::clicked, this, &MainWindow::startUdsUpgrade);
 
     stack_->addWidget(page);
 }
@@ -978,6 +1262,20 @@ void MainWindow::refreshState(const DeviceUiState &state)
     for (auto *button : {channel0StartButton_, channel1StartButton_}) {
         repolish(button);
     }
+
+    if (udsChannelSummaryLabel_ != nullptr) {
+        QString channelText = QStringLiteral("自动链路：0x10 02 -> 0x27 01/02 -> 0x34 -> 0x36 -> 0x37 -> 0x11 01");
+        if (state.channel0Started && state.channel1Started) {
+            channelText.append(QStringLiteral("\n当前通道：CAN0 和 CAN1 都已启动，升级默认使用你选择的通道。"));
+        } else if (state.channel0Started) {
+            channelText.append(QStringLiteral("\n当前通道：CAN0 已启动，可直接升级。"));
+        } else if (state.channel1Started) {
+            channelText.append(QStringLiteral("\n当前通道：CAN1 已启动，可直接升级。"));
+        } else {
+            channelText.append(QStringLiteral("\n当前通道：尚未启动，请先到设备连接页启动 CAN0 或 CAN1。"));
+        }
+        udsChannelSummaryLabel_->setText(channelText);
+    }
 }
 
 void MainWindow::showStartDialog(int channelIndex)
@@ -1039,6 +1337,167 @@ void MainWindow::showStartDialog(int channelIndex)
     dialog.exec();
 }
 
+void MainWindow::browseUdsFirmware()
+{
+    QString startPath = QDir::homePath();
+    if (udsFirmwarePathEdit_ != nullptr && !udsFirmwarePathEdit_->text().isEmpty()) {
+        startPath = udsFirmwarePathEdit_->text();
+    }
+
+    const QString firmwarePath = QFileDialog::getOpenFileName(
+        this,
+        QStringLiteral("选择固件文件"),
+        startPath,
+        QStringLiteral("Firmware Files (*.pkg *.bin *.hex);;All Files (*.*)"));
+    if (firmwarePath.isEmpty()) {
+        return;
+    }
+
+    udsFirmwarePathEdit_->setText(QDir::toNativeSeparators(firmwarePath));
+    updateUdsFirmwareSummary(firmwarePath);
+    saveUdsSettings();
+}
+
+void MainWindow::startUdsUpgrade()
+{
+    if (udsUpgradeManager_ != nullptr && udsUpgradeManager_->isRunning()) {
+        udsUpgradeManager_->cancel();
+        return;
+    }
+
+    const QString firmwarePath = udsFirmwarePathEdit_ != nullptr ? udsFirmwarePathEdit_->text().trimmed() : QString();
+    if (firmwarePath.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先选择固件文件"));
+        return;
+    }
+
+    auto parseUint32 = [this](QLineEdit *edit, int maxNibbles, quint32 *value, const QString &label) -> bool {
+        const QString text = compactHexText(edit != nullptr ? edit->text() : QString(), maxNibbles);
+        if (text.isEmpty()) {
+            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("%1不能为空").arg(label));
+            return false;
+        }
+        bool ok = false;
+        const qulonglong parsed = text.toULongLong(&ok, 16);
+        if (!ok || parsed > 0xFFFFFFFFULL) {
+            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("%1不是有效的十六进制值").arg(label));
+            return false;
+        }
+        *value = static_cast<quint32>(parsed);
+        return true;
+    };
+    UdsUpgradeConfig config = makeTargetUdsUpgradeConfig(
+        udsChannelCombo_ != nullptr && udsChannelCombo_->currentIndex() == 1 ? 1 : 0,
+        QDir::fromNativeSeparators(firmwarePath));
+
+    if (!parseUint32(udsPhysicalIdEdit_, 8, &config.physicalId, QStringLiteral("物理寻址标识 ID"))
+        || !parseUint32(udsResponseIdEdit_, 8, &config.responseId, QStringLiteral("诊断响应标识 ID"))
+        || !parseUint32(udsFunctionalIdEdit_, 8, &config.functionalId, QStringLiteral("功能寻址标识 ID"))
+        || !parseUint32(udsSeedOperatorEdit_, 8, &config.seedKeyOperator, QStringLiteral("27 服务算子"))) {
+        return;
+    }
+
+    saveUdsSettings();
+    stopReceiveTimers();
+    if (udsLogEdit_ != nullptr) {
+        udsLogEdit_->clear();
+    }
+    if (udsProgressBar_ != nullptr) {
+        udsProgressBar_->setValue(0);
+    }
+    appendUdsLog(QStringLiteral("开始执行 UDS 固件升级"));
+    appendUdsLog(QStringLiteral("升级通道：CAN%1").arg(config.channelIndex));
+    appendUdsLog(QStringLiteral("对话参数：PHY %1, RSP %2, FUN %3, 27算子 %4")
+                     .arg(udsHex32(config.physicalId))
+                     .arg(udsHex32(config.responseId))
+                     .arg(udsHex32(config.functionalId))
+                     .arg(udsHex32(config.seedKeyOperator)));
+    appendUdsLog(QStringLiteral("自动流程：0x10 %1 -> 0x27 %2/%3 -> 0x34 -> 0x36 -> 0x37 -> 0x11 %4")
+                     .arg(udsHex8(config.programSessionSubFunction))
+                     .arg(udsHex8(config.seedRequestSubFunction))
+                     .arg(udsHex8(config.keySendSubFunction))
+                     .arg(udsHex8(config.hardResetSubFunction)));
+    if (!udsUpgradeManager_->startUpgrade(config)) {
+        appendUdsLog(QStringLiteral("升级流程未能启动，请检查设备和通道状态"));
+    }
+}
+
+void MainWindow::updateUdsFirmwareSummary(const QString &path)
+{
+    if (udsFirmwareSummaryLabel_ == nullptr) {
+        return;
+    }
+
+    const QFileInfo info(path);
+    if (!info.exists() || !info.isFile()) {
+        udsFirmwareSummaryLabel_->setText(
+            QStringLiteral("HEX 按记录地址下载；PKG/BIN 按生产转换脚本的基地址 0x00000000 下载。"));
+        return;
+    }
+
+    const double sizeKiB = static_cast<double>(info.size()) / 1024.0;
+    const QString suffix = info.suffix().isEmpty() ? QStringLiteral("BIN") : info.suffix().toUpper();
+    udsFirmwareSummaryLabel_->setText(
+        QStringLiteral("已选择 %1 · %2 · %3 KB").arg(info.fileName()).arg(suffix).arg(sizeKiB, 0, 'f', 1));
+}
+
+void MainWindow::appendUdsLog(const QString &message)
+{
+    if (udsLogEdit_ == nullptr) {
+        return;
+    }
+    udsLogEdit_->appendPlainText(message);
+    if (udsLogEdit_->verticalScrollBar() != nullptr) {
+        udsLogEdit_->verticalScrollBar()->setValue(udsLogEdit_->verticalScrollBar()->maximum());
+    }
+}
+
+void MainWindow::loadUdsSettings()
+{
+    QSettings settings;
+    if (udsChannelCombo_ != nullptr) {
+        udsChannelCombo_->setCurrentIndex(settings.value(QStringLiteral("udsUpgrade/channelIndex"), 0).toInt());
+    }
+
+    const auto restoreText = [&settings](const QString &key, QLineEdit *edit, const QString &fallback) {
+        if (edit != nullptr) {
+            edit->setText(settings.value(key, fallback).toString());
+        }
+    };
+
+    restoreText(QStringLiteral("udsUpgrade/physicalId"), udsPhysicalIdEdit_, QStringLiteral("0CD617FD"));
+    restoreText(QStringLiteral("udsUpgrade/responseId"), udsResponseIdEdit_, QStringLiteral("0CD6FD17"));
+    restoreText(QStringLiteral("udsUpgrade/functionalId"), udsFunctionalIdEdit_, QStringLiteral("0CD4FDFD"));
+    restoreText(QStringLiteral("udsUpgrade/seedOperator"), udsSeedOperatorEdit_, QStringLiteral("EDB88317"));
+
+    if (udsFirmwarePathEdit_ != nullptr) {
+        const QString firmwarePath = settings.value(QStringLiteral("udsUpgrade/firmwarePath")).toString();
+        udsFirmwarePathEdit_->setText(firmwarePath);
+        updateUdsFirmwareSummary(firmwarePath);
+    }
+}
+
+void MainWindow::saveUdsSettings() const
+{
+    QSettings settings;
+    if (udsChannelCombo_ != nullptr) {
+        settings.setValue(QStringLiteral("udsUpgrade/channelIndex"), udsChannelCombo_->currentIndex());
+    }
+
+    const auto saveText = [&settings](const QString &key, const QLineEdit *edit) {
+        if (edit != nullptr) {
+            settings.setValue(key, edit->text());
+        }
+    };
+
+    saveText(QStringLiteral("udsUpgrade/physicalId"), udsPhysicalIdEdit_);
+    saveText(QStringLiteral("udsUpgrade/responseId"), udsResponseIdEdit_);
+    saveText(QStringLiteral("udsUpgrade/functionalId"), udsFunctionalIdEdit_);
+    saveText(QStringLiteral("udsUpgrade/seedOperator"), udsSeedOperatorEdit_);
+    saveText(QStringLiteral("udsUpgrade/firmwarePath"), udsFirmwarePathEdit_);
+    settings.sync();
+}
+
 QFrame *MainWindow::makeCardPanel(QWidget *parent) const
 {
     auto *panel = new QFrame(parent);
@@ -1061,10 +1520,13 @@ QPushButton *MainWindow::makeMenuButton(const QString &text, const QString &symb
     auto *button = new QPushButton(text, parent);
     button->setObjectName(QStringLiteral("menuButton"));
     button->setCheckable(true);
-    button->setMinimumHeight(52);
+    button->setFixedHeight(52);
+    button->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     button->setCursor(Qt::PointingHandCursor);
     if (symbol == QStringLiteral("D")) {
         button->setIcon(QIcon(QStringLiteral(":/icons/device.svg")));
+    } else if (symbol == QStringLiteral("UDS")) {
+        button->setIcon(QIcon(QStringLiteral(":/icons/uds-upgrade.svg")));
     } else if (symbol == QStringLiteral("TX")) {
         button->setIcon(QIcon(QStringLiteral(":/icons/can-send.svg")));
     } else if (symbol == QStringLiteral("RX")) {
@@ -1099,10 +1561,14 @@ void MainWindow::applyAppStyle()
         #appRoot {
             background: #f2f2f7;
         }
-        #sidebar, #connectPanel, #deviceTreePanel, #sendListPanel, #receivePanel, #dialogFormPanel {
+        #sidebar, #connectPanel, #deviceTreePanel, #sendListPanel, #receivePanel, #dialogFormPanel, #udsConfigPanel, #udsStatusPanel {
             background: #ffffff;
             border: 1px solid #e5e5ea;
             border-radius: 18px;
+        }
+        #sidebarScroll, #sidebarMenuContainer, #udsScrollArea, #udsPageContent {
+            background: transparent;
+            border: 0px;
         }
         #contentStack, #contentPage {
             background: transparent;
@@ -1112,6 +1578,16 @@ void MainWindow::applyAppStyle()
             font-weight: 700;
             letter-spacing: 0px;
             color: #1c1c1e;
+        }
+        #sectionTitle {
+            font-size: 22px;
+            font-weight: 700;
+            color: #1c1c1e;
+        }
+        #udsHintLabel, #udsSummaryLabel {
+            color: #636366;
+            font-size: 15px;
+            padding-left: 2px;
         }
         #menuButton {
             text-align: left;
@@ -1237,24 +1713,25 @@ void MainWindow::applyAppStyle()
         #deleteButton:pressed {
             background: #ffd4cf;
         }
-        QComboBox {
+        QComboBox, QComboBox#fieldCombo {
             min-height: 36px;
-            border: 0px;
-            border-radius: 0px;
-            background: transparent;
-            padding: 3px 34px 3px 10px;
+            border: 1px solid #d1d1d6;
+            border-radius: 10px;
+            background: #f9f9fb;
+            padding: 3px 34px 3px 12px;
             selection-background-color: #007aff;
-            color: #3a3a3c;
+            color: #1c1c1e;
             font-size: 16px;
             font-weight: 500;
         }
-        QComboBox:focus {
-            background: transparent;
+        QComboBox:focus, QComboBox#fieldCombo:focus {
+            border: 1px solid #007aff;
+            background: #ffffff;
             color: #1c1c1e;
         }
-        QComboBox:disabled {
+        QComboBox:disabled, QComboBox#fieldCombo:disabled {
             color: #8e8e93;
-            background: transparent;
+            background: #f2f2f7;
         }
         QSpinBox {
             min-height: 36px;
@@ -1289,6 +1766,10 @@ void MainWindow::applyAppStyle()
         QLineEdit#fieldEdit:focus {
             border: 1px solid #007aff;
             background: #ffffff;
+        }
+        QLineEdit#fieldEdit:read-only {
+            color: #636366;
+            background: #f2f2f7;
         }
         QLineEdit#filterEdit {
             min-height: 36px;
@@ -1373,12 +1854,42 @@ void MainWindow::applyAppStyle()
             background: #dff7e8;
             color: #188038;
         }
+        #statusPill[state="busy"] {
+            background: #e8f1ff;
+            color: #007aff;
+        }
+        #statusPill[state="error"] {
+            background: #fff1f0;
+            color: #ff3b30;
+        }
         #messageLabel {
             color: #636366;
             font-size: 15px;
             padding: 10px 12px;
             border-radius: 12px;
             background: #f2f2f7;
+        }
+        QProgressBar#udsProgressBar {
+            min-height: 18px;
+            border: 0px;
+            border-radius: 9px;
+            background: #eef0f6;
+            text-align: center;
+            color: #1c1c1e;
+            font-size: 13px;
+            font-weight: 700;
+        }
+        QProgressBar#udsProgressBar::chunk {
+            border-radius: 9px;
+            background: #007aff;
+        }
+        QPlainTextEdit#udsLog {
+            border: 1px solid #e5e5ea;
+            border-radius: 12px;
+            background: #fafbff;
+            color: #1c1c1e;
+            font-size: 14px;
+            padding: 10px;
         }
         #sendScrollArea, #sendListContent {
             border: 0px;
